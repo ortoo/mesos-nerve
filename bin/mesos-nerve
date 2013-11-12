@@ -1,0 +1,272 @@
+#!/usr/bin/env python
+import json
+import logging
+import logging.handlers
+import sys
+import os
+import threading
+import traceback
+import urllib2
+import StringIO
+import gzip
+import tarfile
+import zipfile
+import shutil
+import boto
+import socket
+import pwd
+import grp
+
+import mesos
+import mesos_pb2
+
+SERVICE_CONFIG_BUCKET = 'or2-cluster-service-config'
+NERVE_USER = 'smartstack'
+
+def main():
+  driver = mesos.MesosExecutorDriver(NerveExecutor(sys.argv[1:]))
+  log.info('Ready to serve')
+  sys.exit(0 if driver.run() == mesos_pb2.DRIVER_STOPPED else 1)
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.DEBUG)
+syslog = logging.handlers.SysLogHandler(address = '/dev/log')
+syslog_format = logging.Formatter("%(name)s[%(process)d]: %(message)s")
+syslog.setFormatter(syslog_format)
+log.addHandler(syslog)
+
+class NerveExecutor(mesos.Executor):
+
+  def __init__(self, args):
+    self.args   = args
+    self.task   = None
+    self.driver = None
+    self.runner_thread = None
+    self.shutdown_thread = None
+    self.data   = {}
+    self.env    = {}
+
+    self.s3Conn = None
+
+  def send_state(self, state):
+    try:
+      update               = mesos_pb2.TaskStatus()
+      update.task_id.value = self.task.task_id.value
+      update.state         = state
+      self.driver.sendStatusUpdate(update)
+    except Exception, e:
+      log_exc()
+
+  def run(self):
+    finalstate = mesos_pb2.TASK_FAILED
+
+    try:
+      # First do we have any URIs we need to download
+      if self.data['uris']:
+        for uri in self.data['uris']:
+          downloadAndExtractFile(uri)
+
+      # Setup our s3 connections
+      self.s3Conn = boto.connect_s3()
+
+      # Get the config for the service and reload nerve
+      self.applyNerveConfig(self.data['id'], self.env['PORT'])
+
+      self.send_state(mesos_pb2.TASK_RUNNING)
+    except Exception, e:
+      log_exc()
+      self.send_state(mesos_pb2.TASK_FAILED)
+      self.cleanup()
+
+  def getNerveConfig(self, service, port):
+    serviceConfBucket = self.s3Conn.get_bucket(SERVICE_CONFIG_BUCKET)
+    if not serviceConfBucket:
+      raise Exception("Can't find service config bucket")
+
+    key = serviceConfBucket.get_key(service)
+    if not (key and key.exists()):
+      raise Exception("Can't find service config for service: " + service)
+
+    contents = key.get_contents_as_string()
+    data = json.loads(contents)
+    nerveConfig = data['nerve']
+
+    # Fill in any missing bits (zk_hosts and zk_path etc)
+    nerveConfig['port'] = port
+    nerveConfig['host'] = getHostName()
+    nerveConfig['zk_hosts'] = getZooKeeperHosts()
+    nerveConfig['zk_path'] = "test zk path"
+
+    return nerveConfig
+
+  def applyNerveConfig(self, service, port):
+    cfg = self.getNerveConfig(service, port)
+    writeNerveConfigFile(cfg, service, port)
+
+
+  #### Mesos Executor API methods ####
+
+  def registered(self, driver, executorInfo, frameworkInfo, slaveInfo):
+    log.info('Registered with Mesos slave')
+
+  def reregistered(driver, slaveInfo):
+    log.info('Reregistered with Mesos slave')
+
+  def disconnected(driver):
+    log.warning('Disconnected from Mesos slave')
+
+  def launchTask(self, driver, task):
+    if self.task is not None:
+      log.error('Executor was reused but this executor is not reuseable')
+      exit(2)
+    self.task   = task
+    self.driver = driver
+    log.info('Task is: %s' % task.task_id.value)
+    try:
+      self.data = json.loads(task.data) if task.data else {}
+      for line in json_pp(self.data).splitlines():
+        log.info(line)
+      self.env = self.data['env'] if 'env' in self.data else {}
+      if 'port' in self.data:
+        port = int(self.data['port'])
+        if port != 0:
+          self.env['PORT'] = str(port)
+      if 'ports' in self.data:
+        for i, port in enumerate( int(s) for s in self.data['ports'] ):
+          if port != 0:
+            self.env['PORT'+str(i)] = str(port)
+        if 'PORT0' in self.env:
+          self.env['PORT'] = self.env['PORT0']
+      for k, v in self.env.items():
+        os.environ[k] = str(v)
+    except Exception, e:
+      log.error('JSON from framework is rubbish')
+      log_exc()
+    try:
+      self.run_thread = threading.Thread(target=self.run)
+      self.run_thread.daemon = True
+      self.run_thread.start()
+      pass
+    except Exception, e:
+      log_exc()
+      self.send_state(mesos_pb2.TASK_FAILED)
+      exit(2)
+
+  def killTask(self, driver, task_id):
+    if self.task.task_id.value == task_id.value:
+      log.info('Asked to shutdown managed task %s' % task_id.value)
+      self.cleanup()
+    else:
+      log.info('Asked to shutdown unknown task %s' % task_id.value)
+    self.send_state(mesos_pb2.TASK_FINISHED)
+
+  def cleanup(self):
+    if self.env['port'] and self.data['id']:
+      cleanupNerveConfig(self.data['id'], self.env['port'])
+
+  def shutdown(self, driver):
+    self.cleanup()
+
+
+# END CLASS
+
+def getZooKeeperHosts():
+  hostsStr = open('/etc/mesos/zk', 'r').read()
+  # Hosts will be of the form zk://host1:port1,host2:port2,host3:port3/path
+  hostsSplit = hostsStr.split('/')
+  hostsList = hostsSplit[2]
+  hosts = hostsList.split(',')
+  hosts = [host.strip() for host in hosts]
+  return hosts
+
+def makeNerveOwner(filename):
+  uid = pwd.getpwnam(NERVE_USER).pw_uid
+  gid = grp.getgrnam(NERVE_USER).gr_gid
+  os.chown(filename, uid, gid)
+
+def getNerveConfigFilename(serviceName, port):
+  return '/opt/smartstack/nerve/nerve_services/%s_%s.json' % (serviceName, port)
+
+def writeNerveConfigFile(cfg, service, port):
+  fname = getNerveConfigFilename(service, port)
+  ff = open(fname, 'w')
+  ff.write(json.dumps(cfg))
+  ff.close()
+  makeNerveOwner(fname)
+  
+def getHostName():
+  hostname = None
+  try:
+    response = urllib2.urlopen("http://169.254.169.254/latest/meta-data/public-hostname", None, 1)
+    hostname = response.read()
+  except Exception, e:
+    hostname = socket.gethostname()
+  return hostname
+
+def cleanupNerveConfig(serviceName, port):
+  fname = getNerveConfigFilename(serviceName, port)
+  if os.path.isfile(fname):
+    os.unlink(fname)
+
+def untarFile(fileobj):
+  tar = tarfile.open(fileobj=fileobj)
+  tar.extractall()
+  tar.close()
+  fileobj.close()
+
+def unzipFile(fileobj):
+  zp = zipfile.ZipFile(fileobj, 'r')
+  zp.extractall()
+  zp.close()
+  fileobj.close()
+
+def downloadAndExtractFile(uri):
+
+  filename = uri.split('/')[-1]
+
+  # Download the filename
+  httpresponse = urllib2.urlopen(uri)
+  response = StringIO.StringIO(httpresponse.read())
+  httpresponse.close()
+
+  # Do we need to unzip?
+  if filename.endswith('.tar.gz') or filename.endswith('.tgz'):
+    decompressed = gzip.GzipFile(fileobj=response)
+    seekable = StringIO.StringIO(decompressed.read())
+    response.close()
+    decompressed.close()
+    untarFile(seekable)
+    seekable.close()
+  elif filename.endswith('.tar'):
+    untarFile(response)
+  elif filename.endswith('.zip'):
+    unzipFile(response)
+  else:
+    # We just write the file
+    ff = open(filename, 'w')
+    ff.write(response.read())
+    ff.close()
+
+# This function shows up in many places but because it's final statement is a
+# call to os._exit() we can be sure it is only ever called one time.
+def exit(returncode):
+    try:
+      # Do any cleanup here
+      pass
+    except Exception, e:
+      log_exc()
+    finally:
+      os._exit( ((-returncode) + 128) if returncode < 0 else returncode )
+
+# Pretty print
+def json_pp(thing):
+  s = json.dumps(thing, indent=2, separators=(',', ': '), sort_keys=True)
+  data_lines = s.splitlines()[1:-1]
+  return "{ " + '\n'.join([data_lines[0][2:]] + data_lines[1:]) + " }"
+
+def log_exc():
+  for line in traceback.format_exc().splitlines():
+    log.error(line)
+
+if __name__ == '__main__':
+    main()
